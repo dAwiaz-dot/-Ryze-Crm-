@@ -2,12 +2,13 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { isRbacError, rbacErrorResponse, requirePermission } from "@/lib/rbac";
 import { getDemoSearchJob } from "@/services/demo/demo-store";
-import { toSearchJobDto } from "@/services/search-jobs/search-job.service";
+import { advanceSearchJob, toSearchJobDto } from "@/services/search-jobs/search-job.service";
 
 export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     await requirePermission("searchJobs:read");
     const { id } = await params;
+    await advanceSearchJob(id);
     const job = await prisma.searchJob.findUnique({
       where: { id },
       include: { user: { select: { id: true, name: true, email: true } } }

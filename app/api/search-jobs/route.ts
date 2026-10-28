@@ -11,7 +11,8 @@ import { getDemoSecretSettings } from "@/services/demo/settings-store";
 import { recordAudit } from "@/services/audit/audit.service";
 import {
   createSearchJob,
-  processSearchJob,
+  getSearchJobDto,
+  startSearchJob,
   searchJobSchema,
   toSearchJobDto,
   type SearchJobInput
@@ -58,9 +59,11 @@ export async function POST(request: Request) {
       request
     });
 
-    void processSearchJob(job.id);
+    // So dispara a run na Apify (resposta rapida); a coleta avanca a cada consulta de status.
+    await startSearchJob(job.id);
+    const startedJob = (await getSearchJobDto(job.id)) ?? toSearchJobDto(job);
 
-    return NextResponse.json({ job: toSearchJobDto(job) }, { status: 202 });
+    return NextResponse.json({ job: startedJob }, { status: 202 });
   } catch (error) {
     if (isRbacError(error)) return rbacErrorResponse(error);
     if (!parsed.success) {

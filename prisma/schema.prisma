@@ -334,6 +334,7 @@ model SearchJob {
   message        String          @default("Na fila")
   resultCount    Int             @default(0)
   duplicateCount Int             @default(0)
+  apifyRunId     String?
   error          String?         @db.Text
   startedAt      DateTime?
   completedAt    DateTime?

@@ -62,3 +62,26 @@ test("normalizeApifyPlace keeps requested city state and category for filtering"
   assert.equal(lead.website, null);
   assert.deepEqual(filterLeads([lead], { ...filters, onlyWithoutWebsite: true, onlyWithWhatsApp: true }).map((item) => item.company), ["Clínica Real"]);
 });
+
+test("normalizeApifyPlace treats social links as no own website and flags only mobiles as WhatsApp", () => {
+  const instagramOnly = normalizeApifyPlace(
+    { title: "Pizzaria Bella", phoneUnformatted: "+553532221234", website: "https://www.instagram.com/pizzariabella/" },
+    filters,
+    0
+  );
+
+  assert.equal(instagramOnly.website, null);
+  assert.equal(instagramOnly.instagram, "https://www.instagram.com/pizzariabella/");
+  assert.equal(instagramOnly.socialUrl, "https://www.instagram.com/pizzariabella/");
+  assert.equal(instagramOnly.hasWhatsApp, false);
+
+  const ownSite = normalizeApifyPlace(
+    { title: "Clinica Beta", phoneUnformatted: "+5535988881234", website: "https://clinicabeta.com.br" },
+    filters,
+    1
+  );
+
+  assert.equal(ownSite.website, "https://clinicabeta.com.br");
+  assert.equal(ownSite.socialUrl, null);
+  assert.equal(ownSite.hasWhatsApp, true);
+});

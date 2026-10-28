@@ -1,7 +1,7 @@
 import { SearchJobStatus, type Prisma } from "@prisma/client";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
-import { ApifyGoogleMapsService } from "@/services/apify.service";
+import { ApifyGoogleMapsService, isApifyRunFailed } from "@/services/apify.service";
 import { recordAudit } from "@/services/audit/audit.service";
 import { filterLeads } from "@/services/lead-filter.service";
 import type { Lead, LeadSearchFilters } from "@/types/lead";
@@ -26,7 +26,15 @@ type JobWithUser = Prisma.SearchJobGetPayload<{
 }>;
 
 const runningJobs = new Set<string>();
-const terminalStatuses = new Set<SearchJobStatus>([SearchJobStatus.SUCCEEDED, SearchJobStatus.FAILED, SearchJobStatus.CANCELLED]);
+const jobInclude = { user: { select: { id: true, name: true, email: true } } } as const;
+
+// Progresso de cada fase. A busca nao roda "solta" no servidor (a Vercel encerra a funcao
+// quando a resposta sai): o POST so inicia a run na Apify e cada consulta de status
+// (SSE / GET do job) avanca o job um passo com advanceSearchJob.
+const PROGRESS_COLLECTING = 25;
+const PROGRESS_SAVING = 65;
+const SEARCH_TIMEOUT_MS = 20 * 60 * 1000;
+const STALE_SAVE_MS = 2 * 60 * 1000;
 
 export function toSearchJobDto(job: JobWithUser): SearchJobDto {
   return {
@@ -68,41 +76,78 @@ export async function createSearchJob(filters: SearchJobInput, userId?: string) 
   });
 }
 
-export async function processSearchJob(jobId: string) {
+export async function getSearchJobDto(jobId: string) {
+  const job = await prisma.searchJob.findUnique({ where: { id: jobId }, include: jobInclude });
+  return job ? toSearchJobDto(job) : null;
+}
+
+export async function startSearchJob(jobId: string) {
+  try {
+    const job = await prisma.searchJob.findUnique({ where: { id: jobId } });
+    if (!job || job.status !== SearchJobStatus.PENDING) return;
+
+    const filters: LeadSearchFilters = searchJobSchema.parse(job.filters);
+    const runId = await (await createApifyService()).startRun(filters);
+
+    await updateJob(jobId, {
+      status: SearchJobStatus.RUNNING,
+      startedAt: new Date(),
+      apifyRunId: runId,
+      progress: PROGRESS_COLLECTING,
+      message: "Coletando empresas no Google Maps via Apify"
+    });
+  } catch (error) {
+    await failJob(jobId, error);
+  }
+}
+
+export async function advanceSearchJob(jobId: string) {
   if (runningJobs.has(jobId)) return;
   runningJobs.add(jobId);
 
   try {
-    const job = await prisma.searchJob.findUnique({
-      where: { id: jobId }
-    });
+    const job = await prisma.searchJob.findUnique({ where: { id: jobId } });
+    if (!job || job.status !== SearchJobStatus.RUNNING || !job.apifyRunId) return;
 
-    if (!job || terminalStatuses.has(job.status)) return;
+    // Outra requisicao ja esta gravando os leads; so assume se ela parou de dar sinal.
+    const savingInProgress = job.progress >= PROGRESS_SAVING && Date.now() - job.updatedAt.getTime() < STALE_SAVE_MS;
+    if (savingInProgress) return;
 
     const filters: LeadSearchFilters = searchJobSchema.parse(job.filters);
-    await updateJob(jobId, {
-      status: SearchJobStatus.RUNNING,
-      startedAt: new Date(),
-      progress: 10,
-      message: "Conectando na Apify"
-    });
+    const service = await createApifyService();
+    const run = await service.getRun(job.apifyRunId);
 
-    const settings = await prisma.appSettings.findFirst({ select: { apifyToken: true } });
-    const token = settings?.apifyToken?.trim() || process.env.APIFY_TOKEN || "";
-    if (!token) {
-      throw new Error("Apify Token nao configurado. Cadastre o token em Configuracoes para buscar leads reais.");
+    if (isApifyRunFailed(run.status)) {
+      throw new Error(`A Apify encerrou a busca com status ${run.status}.`);
     }
 
-    const service = new ApifyGoogleMapsService(token);
-    await updateJob(jobId, { progress: 25, message: "Coletando empresas reais no Google Maps via Apify" });
-    const rawLeads = await service.search(filters);
+    if (run.status !== "SUCCEEDED" || !run.datasetId) {
+      const elapsedMs = Date.now() - (job.startedAt ?? job.createdAt).getTime();
+      if (elapsedMs > SEARCH_TIMEOUT_MS) {
+        throw new Error("A Apify passou de 20 minutos sem terminar. Tente uma busca com menos resultados.");
+      }
 
-    await updateJob(jobId, { progress: 65, message: "Aplicando filtros e removendo duplicados" });
+      const elapsedMinutes = Math.floor(elapsedMs / 60_000);
+      await updateJob(jobId, {
+        progress: Math.min(PROGRESS_SAVING - 5, PROGRESS_COLLECTING + Math.floor(elapsedMs / 10_000)),
+        message: `Coletando empresas no Google Maps via Apify${elapsedMinutes > 0 ? ` (${elapsedMinutes} min)` : ""}`
+      });
+      return;
+    }
+
+    // Trava otimista: so uma requisicao grava os leads (quem chegar depois ve updatedAt diferente).
+    const claimed = await prisma.searchJob.updateMany({
+      where: { id: jobId, status: SearchJobStatus.RUNNING, updatedAt: job.updatedAt },
+      data: { progress: PROGRESS_SAVING, message: "Aplicando filtros e removendo duplicados" }
+    });
+    if (claimed.count === 0) return;
+
+    const rawLeads = await service.fetchLeads(run.datasetId, filters);
     const leads = filterLeads(rawLeads, filters);
     const duplicates = Math.max(0, rawLeads.length - leads.length);
 
     await updateJob(jobId, { progress: 78, message: "Gravando leads no PostgreSQL" });
-    const saved = await persistLeads(leads);
+    const saved = await persistLeads(jobId, leads);
     const finalMessage = buildSearchResultMessage(rawLeads.length, leads.length, saved);
 
     await prisma.searchHistory.create({
@@ -137,51 +182,78 @@ export async function processSearchJob(jobId: string) {
       metadata: { saved, duplicates }
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Falha inesperada na busca.";
-    const job = await prisma.searchJob
-      .update({
-        where: { id: jobId },
-        data: {
-          status: SearchJobStatus.FAILED,
-          progress: 100,
-          message: "Busca falhou",
-          error: message,
-          completedAt: new Date()
-        }
-      })
-      .catch(() => null);
-
-    await recordAudit({
-      action: "SEARCH_JOB_FAILED",
-      entity: "SearchJob",
-      entityId: jobId,
-      userId: job?.userId,
-      metadata: { error: message }
-    });
+    await failJob(jobId, error);
   } finally {
     runningJobs.delete(jobId);
   }
+}
+
+async function createApifyService() {
+  const settings = await prisma.appSettings.findFirst({ select: { apifyToken: true } });
+  const token = settings?.apifyToken?.trim() || process.env.APIFY_TOKEN || "";
+  if (!token) {
+    throw new Error("Apify Token nao configurado. Cadastre o token em Configuracoes para buscar leads reais.");
+  }
+
+  return new ApifyGoogleMapsService(token);
+}
+
+async function failJob(jobId: string, error: unknown) {
+  const message = error instanceof Error ? error.message : "Falha inesperada na busca.";
+  const job = await prisma.searchJob
+    .update({
+      where: { id: jobId },
+      data: {
+        status: SearchJobStatus.FAILED,
+        progress: 100,
+        message: "Busca falhou",
+        error: message,
+        completedAt: new Date()
+      }
+    })
+    .catch(() => null);
+
+  await recordAudit({
+    action: "SEARCH_JOB_FAILED",
+    entity: "SearchJob",
+    entityId: jobId,
+    userId: job?.userId,
+    metadata: { error: message }
+  });
 }
 
 async function updateJob(jobId: string, data: Prisma.SearchJobUpdateInput) {
   await prisma.searchJob.update({ where: { id: jobId }, data });
 }
 
-async function persistLeads(leads: Lead[]) {
+async function persistLeads(jobId: string, leads: Lead[]) {
   let saved = 0;
+  const categoryIds = new Map<string, string>();
+  const cityIds = new Map<string, string>();
 
   for (const lead of leads) {
-    const category = await prisma.category.upsert({
-      where: { name: lead.category },
-      update: {},
-      create: { name: lead.category }
-    });
+    let categoryId = categoryIds.get(lead.category);
+    if (!categoryId) {
+      const category = await prisma.category.upsert({
+        where: { name: lead.category },
+        update: {},
+        create: { name: lead.category }
+      });
+      categoryId = category.id;
+      categoryIds.set(lead.category, categoryId);
+    }
 
-    const city = await prisma.city.upsert({
-      where: { name_state: { name: lead.city, state: lead.state } },
-      update: {},
-      create: { name: lead.city, state: lead.state }
-    });
+    const cityKey = `${lead.city}|${lead.state}`;
+    let cityId = cityIds.get(cityKey);
+    if (!cityId) {
+      const city = await prisma.city.upsert({
+        where: { name_state: { name: lead.city, state: lead.state } },
+        update: {},
+        create: { name: lead.city, state: lead.state }
+      });
+      cityId = city.id;
+      cityIds.set(cityKey, cityId);
+    }
 
     await prisma.lead.upsert({
       where: {
@@ -200,8 +272,8 @@ async function persistLeads(leads: Lead[]) {
         latitude: lead.latitude,
         longitude: lead.longitude,
         hasWhatsApp: lead.hasWhatsApp,
-        categoryId: category.id,
-        cityId: city.id,
+        categoryId,
+        cityId,
         rawPayload: lead
       },
       create: {
@@ -219,12 +291,17 @@ async function persistLeads(leads: Lead[]) {
         longitude: lead.longitude,
         hasWhatsApp: lead.hasWhatsApp,
         status: lead.status,
-        categoryId: category.id,
-        cityId: city.id,
+        categoryId,
+        cityId,
         rawPayload: lead
       }
     });
     saved += 1;
+
+    // Mantem updatedAt fresco pra outra requisicao nao achar que a gravacao travou.
+    if (saved % 50 === 0) {
+      await updateJob(jobId, { message: `Gravando leads (${saved}/${leads.length})` });
+    }
   }
 
   return saved;

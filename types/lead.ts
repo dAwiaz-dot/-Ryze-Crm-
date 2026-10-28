@@ -9,6 +9,8 @@ export type Lead = {
   state: string;
   website: string | null;
   instagram: string | null;
+  // Link de rede social/agregador que veio no campo "site" do Google Maps (fica so no rawPayload).
+  socialUrl?: string | null;
   googleMapsUrl: string | null;
   category: string;
   rating: number | null;

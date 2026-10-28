@@ -74,6 +74,10 @@ export function SearchLeadsForm() {
     const payload = (await response.json()) as { jobs: SearchJobDto[] };
     setJobs(payload.jobs);
     setActiveJob((current) => current ?? payload.jobs[0] ?? null);
+
+    // Retoma o acompanhamento se a pagina foi recarregada com uma busca em andamento.
+    const runningJob = payload.jobs.find((job) => !terminalStatuses.has(job.status));
+    if (runningJob && !eventSourceRef.current) connectToJob(runningJob.id);
   }
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
@@ -136,8 +140,17 @@ export function SearchLeadsForm() {
       return;
     }
 
-    setActiveJob(payload.job);
-    setJobs((current) => upsertJob(current, payload.job!));
+    const job = payload.job;
+    setActiveJob(job);
+    setJobs((current) => upsertJob(current, job));
+
+    // A conexao SSE cai quando a funcao serverless atinge o limite de tempo; reconecta
+    // enquanto a busca nao terminar (e a propria consulta faz a busca avancar).
+    if (!terminalStatuses.has(job.status)) {
+      window.setTimeout(() => connectToJob(job.id), 3000);
+    } else {
+      showSearchResultToast(job);
+    }
   }
 
   function handleSearchError(status: number, message?: string) {
@@ -243,9 +256,9 @@ export function SearchLeadsForm() {
 
             <div className="grid gap-3 rounded-lg border bg-background/70 p-4">
               {[
-                ["onlyWithoutWebsite", "Somente empresas sem site"],
+                ["onlyWithoutWebsite", "Somente sem site proprio (inclui quem so tem Instagram/Facebook)"],
                 ["onlyWithPhone", "Somente empresas com telefone"],
-                ["onlyWithWhatsApp", "Somente empresas com WhatsApp"],
+                ["onlyWithWhatsApp", "Somente celular (WhatsApp)"],
                 ["ignoreDuplicates", "Ignorar duplicados"]
               ].map(([key, label]) => (
                 <label key={key} className="flex cursor-pointer items-center gap-3 text-sm font-medium">

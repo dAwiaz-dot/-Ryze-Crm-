@@ -1,12 +1,14 @@
 import { prisma } from "@/lib/prisma";
 import { isRbacError, rbacErrorResponse, requirePermission } from "@/lib/rbac";
 import { getDemoSearchJob } from "@/services/demo/demo-store";
-import { toSearchJobDto } from "@/services/search-jobs/search-job.service";
+import { advanceSearchJob, toSearchJobDto } from "@/services/search-jobs/search-job.service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const terminalStatuses = new Set(["SUCCEEDED", "FAILED", "CANCELLED"]);
+// Consulta a Apify a cada 4 ticks (~4s); o banco e lido a cada 1s.
+const ADVANCE_EVERY_TICKS = 4;
 
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -27,7 +29,10 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
           }
         });
 
+        let tick = 0;
         while (!closed) {
+          if (tick % ADVANCE_EVERY_TICKS === 0) await advanceSearchJob(id);
+          tick += 1;
           const job = await prisma.searchJob.findUnique({
             where: { id },
             include: { user: { select: { id: true, name: true, email: true } } }
